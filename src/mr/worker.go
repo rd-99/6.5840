@@ -1,11 +1,14 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
-import "os"
-
+import (
+	"encoding/json"
+	"fmt"
+	"hash/fnv"
+	"log"
+	"net/rpc"
+	"os"
+	"time"
+)
 
 // Map functions return a slice of KeyValue.
 type KeyValue struct {
@@ -23,7 +26,6 @@ func ihash(key string) int {
 
 var coordSockName string // socket for coordinator
 
-
 // main/mrworker.go calls this function.
 func Worker(sockname string, mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
@@ -31,10 +33,110 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 	coordSockName = sockname
 
 	// Your worker implementation here.
+	for {
+		task := getTask()
+
+		switch task.Type {
+		case MapTask:
+			content, err := os.ReadFile(task.File)
+			if err != nil {
+				log.Fatalf("cannot read %v", task.File)
+			}
+			// Call map function
+			kva := mapf(task.File, string(content))
+			// Write intermediate key-value pairs to files
+			buckets := make([][]KeyValue, task.nReduce)
+			for _, kv := range kva {
+				haskKey := ihash(kv.Key) % task.nReduce
+				buckets[haskKey] = append(buckets[haskKey], kv)
+			}
+
+			for y, bucket := range buckets {
+				// create temp file
+				fileName := fmt.Sprintf("mr-%d-%d", task.Id, y)
+				tmpFile, err := os.CreateTemp(".", "mr-tmp-*")
+				if err != nil {
+					log.Fatalf("file creation error in task %d", task.Id)
+				}
+				enc := json.NewEncoder(tmpFile)
+				for _, kv := range bucket {
+					if err := enc.Encode(&kv); err != nil {
+						log.Fatalf("error in encoding to json- Task - %d, bucket - %d", task.Id, y)
+					}
+				}
+				tmpFile.Close()
+				os.Rename(tmpFile.Name(), fileName)
+			}
+
+			reportTaskDone(task)
+		case ReduceTask:
+			intermediate := []KeyValue{}
+			for i := 0; i < task.nReduce; i++ {
+				fileName := fmt.Sprintf("mr-%d-%d", task.Id, i)
+				fileContent, err := os.Open(fileName)
+				if err != nil {
+					fmt.Printf("encountered error while file opening, task- %d, file- %d", task.Id, i)
+				}
+				reader := json.NewDecoder(fileContent)
+				for {
+					var kv KeyValue
+					if err := reader.Decode(&kv); err != nil {
+						break
+					}
+					intermediate = append(intermediate, kv)
+				}
+				fileContent.Close()
+			}
+
+			freq := map[string][]string{}
+			for _, kv := range intermediate {
+				freq[kv.Key] = append(freq[kv.Key], kv.Value)
+			}
+
+			// create output file
+			outFileName := fmt.Sprintf("mr-out-%d", task.Id)
+			outFile, err := os.Create(outFileName)
+			if err != nil {
+				log.Fatalf("error in creating output file for task %d", task.Id)
+			}
+
+			// Call reduce function and write to output file
+			for key, values := range freq {
+				result := reducef(key, values)
+				fmt.Fprintf(outFile, "%s %s\n", key, result)
+			}
+			outFile.Close()
+		case 0:
+			time.Sleep(time.Second)
+		}
+	}
 
 	// uncomment to send the Example RPC to the coordinator.
 	// CallExample()
 
+}
+
+func reportTaskDone(task *Task) {
+	requestArg := NotifyTaskDoneRequest{
+		Id:   task.Id,
+		Type: task.Type,
+	}
+	responseArg := TaskReply{
+		task: task,
+	}
+	call("Coordinator.MarkTaskComplete", requestArg, responseArg)
+}
+
+func getTask() *Task {
+
+	req := struct{}{}
+	var reply TaskReply
+
+	err := call("Coordinator.fetchTask", &req, &reply)
+	if err == true {
+		return &Task{}
+	}
+	return reply.task
 }
 
 // example function to show how to make an RPC call to the coordinator.
