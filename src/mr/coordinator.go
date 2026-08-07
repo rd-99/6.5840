@@ -7,6 +7,7 @@ import (
 	"net/rpc"
 	"os"
 	"sync"
+	"time"
 )
 
 type Coordinator struct {
@@ -82,10 +83,12 @@ func MakeCoordinator(sockname string, files []string, nReduce int) *Coordinator 
 			Id:      i,
 			Status:  IdleStatus,
 			NReduce: nReduce,
+			NMap:    len(files),
 		}
 	}
 
 	c.server(sockname)
+	go c.reapTimedOutTasks()
 	return &c
 }
 
@@ -99,6 +102,7 @@ func (c *Coordinator) FetchTask(args *struct{}, reply *TaskReply) error {
 		for i, task := range c.mapTasks {
 			if task.Status == IdleStatus || task.Status == FailedStatus {
 				c.mapTasks[i].Status = RunningStatus
+				c.mapTasks[i].AssignedAt = time.Now()
 				reply.Task = &c.mapTasks[i]
 				return nil
 			}
@@ -108,6 +112,7 @@ func (c *Coordinator) FetchTask(args *struct{}, reply *TaskReply) error {
 		for i, task := range c.reduceTasks {
 			if task.Status == IdleStatus || task.Status == FailedStatus {
 				c.reduceTasks[i].Status = RunningStatus
+				c.reduceTasks[i].AssignedAt = time.Now()
 				reply.Task = &c.reduceTasks[i]
 				return nil
 			}
@@ -132,19 +137,39 @@ func (c *Coordinator) MarkTaskComplete(args *NotifyTaskDoneRequest, reply *TaskR
 	switch args.Type {
 	case MapTask:
 		taskId := args.Id
-		c.mapTasks[taskId].Status = DoneStatus
-		c.reduceTasks[taskId].File = c.mapTasks[taskId].File
+		c.mapTasks[taskId].Status = args.UpdatedStatus
 
 		if c.checkAllMapTasksDone() {
 			c.phase = ReducePhase
 		}
 	case ReduceTask:
-		c.reduceTasks[args.Id].Status = DoneStatus
+		c.reduceTasks[args.Id].Status = args.UpdatedStatus
 		if c.checkAllReduceTasksDone() {
 			c.phase = DonePhase
 		}
 	}
 	return nil
+}
+
+func (c *Coordinator) reapTimedOutTasks() {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		c.mu.Lock()
+		now := time.Now()
+		for i := range c.mapTasks {
+			if c.mapTasks[i].Status == RunningStatus && now.Sub(c.mapTasks[i].AssignedAt) >= 10*time.Second {
+				c.mapTasks[i].Status = FailedStatus
+			}
+		}
+		for i := range c.reduceTasks {
+			if c.reduceTasks[i].Status == RunningStatus && now.Sub(c.reduceTasks[i].AssignedAt) >= 10*time.Second {
+				c.reduceTasks[i].Status = FailedStatus
+			}
+		}
+		c.mu.Unlock()
+	}
 }
 
 func (c *Coordinator) checkAllMapTasksDone() bool {

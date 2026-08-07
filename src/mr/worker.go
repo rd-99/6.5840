@@ -1,6 +1,7 @@
 package mr
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
@@ -49,97 +50,33 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 		if err != nil {
 			log.Fatalf("failed to get task: %v", err)
 		}
-
+		c, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
 		switch task.Type {
 		case MapTask:
-
-			content, err := os.ReadFile(task.File)
+			err := PerformMapTask(c, task, mapf)
+			if err == context.DeadlineExceeded {
+				reportTaskDone(task, FailedStatus)
+				continue
+			}
 			if err != nil {
-				log.Fatalf("cannot read %v", task.File)
+				reportTaskDone(task, FailedStatus)
+				continue
 			}
-			// Call map function
-			kva := mapf(task.File, string(content))
-			// Write intermediate key-value pairs to files
-			buckets := make([][]KeyValue, task.NReduce)
-			for _, kv := range kva {
-				haskKey := ihash(kv.Key) % task.NReduce
-				buckets[haskKey] = append(buckets[haskKey], kv)
-			}
-
-			
-
-			for y, bucket := range buckets {
-				// create temp file
-				fileName := fmt.Sprintf("mr-%d-%d", task.Id, y)
-				tmpFile, err := os.CreateTemp(".", "mr-tmp-*")
-				if err != nil {
-					log.Fatalf("file creation error in task %d", task.Id)
-				}
-				enc := json.NewEncoder(tmpFile)
-				for _, kv := range bucket {
-					if err := enc.Encode(&kv); err != nil {
-						log.Fatalf("error in encoding to json- Task - %d, bucket - %d", task.Id, y)
-					}
-				}
-				tmpFile.Close()
-				os.Rename(tmpFile.Name(), fileName)
-			}
-			reportTaskDone(task)
+			reportTaskDone(task, DoneStatus)
 
 		case ReduceTask:
-			intermediate := []KeyValue{}
-			for i := 0; i < task.NReduce; i++ {
-				fileName := fmt.Sprintf("mr-%d-%d", task.Id, i)
-				fileContent, err := os.Open(fileName)
-				if err != nil {
-					fmt.Printf("encountered error while file opening, task- %d, file- %d, err- %v", task.Id, i, err.Error())
-				}
-				reader := json.NewDecoder(fileContent)
-				for {
-					var kv KeyValue
-					err := reader.Decode(&kv)
-					if err == io.EOF {
-						break
-					}
-					if err != nil {
-						fmt.Printf("error decoding json: %v", err.Error())
-						break
-					}
-					intermediate = append(intermediate, kv)
-				}
-				fileContent.Close()
+			err := PerformReduceTask(c, task, reducef)
+			if err == context.DeadlineExceeded {
+				reportTaskDone(task, FailedStatus)
+				continue
 			}
-
-			sort.Sort(ByKey(intermediate))
-
-			// create output file
-			outFileName := fmt.Sprintf("mr-out-%d", task.Id)
-			outFile, err := os.Create(outFileName)
 			if err != nil {
-				log.Fatalf("error in creating output file for task %d", task.Id)
+				reportTaskDone(task, FailedStatus)
+				continue
 			}
 
-			// Call reduce function and write to output file
-
-			i := 0
-			for i < len(intermediate) {
-				j := i + 1
-				for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
-					j++
-				}
-				values := []string{}
-				for k := i; k < j; k++ {
-					values = append(values, intermediate[k].Value)
-				}
-				output := reducef(intermediate[i].Key, values)
-
-				fmt.Fprintf(outFile, "%v %v\n", intermediate[i].Key, output)
-
-				i = j
-			}
-
-			outFile.Close()
-			reportTaskDone(task)
+			reportTaskDone(task, DoneStatus)
 		case IdleTask:
 			time.Sleep(time.Second)
 		}
@@ -150,10 +87,11 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 
 }
 
-func reportTaskDone(task *Task) {
+func reportTaskDone(task *Task, updatedStatus TaskStatus) {
 	requestArg := NotifyTaskDoneRequest{
-		Id:   task.Id,
-		Type: task.Type,
+		Id:            task.Id,
+		Type:          task.Type,
+		UpdatedStatus: updatedStatus,
 	}
 	responseArg := TaskReply{
 		Task: task,
@@ -216,4 +154,115 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 	}
 	log.Printf("%d: call failed err %v", os.Getpid(), err)
 	return false
+}
+
+func PerformMapTask(c context.Context, task *Task, mapf func(string, string) []KeyValue) error {
+
+	content, err := os.ReadFile(task.File)
+	if err != nil {
+		return err
+	}
+	if err := c.Err(); err != nil {
+		return err
+	}
+	// Call map function
+	kva := mapf(task.File, string(content))
+	// Write intermediate key-value pairs to files
+	buckets := make([][]KeyValue, task.NReduce)
+	for _, kv := range kva {
+		if err := c.Err(); err != nil {
+			return err
+		}
+		haskKey := ihash(kv.Key) % task.NReduce
+		buckets[haskKey] = append(buckets[haskKey], kv)
+	}
+
+	for y, bucket := range buckets {
+		if err := c.Err(); err != nil {
+			return err
+		}
+		// create temp file
+		fileName := fmt.Sprintf("mr-%d-%d", task.Id, y)
+		tmpFile, err := os.CreateTemp(".", "mr-tmp-*")
+		if err != nil {
+			return err
+		}
+		enc := json.NewEncoder(tmpFile)
+		for _, kv := range bucket {
+			if err := enc.Encode(&kv); err != nil {
+				return err
+			}
+		}
+		tmpFile.Close()
+		os.Rename(tmpFile.Name(), fileName)
+	}
+	return nil
+}
+
+func PerformReduceTask(c context.Context, task *Task, reducef func(string, []string) string) error {
+	intermediate := []KeyValue{}
+	for m := 0; m < task.NMap; m++ {
+		if err := c.Err(); err != nil {
+			return err
+		}
+		fileName := fmt.Sprintf("mr-%d-%d", m, task.Id)
+		fileContent, err := os.Open(fileName)
+		if err != nil {
+			fmt.Printf("encountered error while opening file mr-%d-%d: %v\n", m, task.Id, err)
+			continue
+		}
+		reader := json.NewDecoder(fileContent)
+		for {
+			if err := c.Err(); err != nil {
+				fileContent.Close()
+				return err
+			}
+			var kv KeyValue
+			err := reader.Decode(&kv)
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				fmt.Printf("error decoding json from %s: %v\n", fileName, err)
+				break
+			}
+			intermediate = append(intermediate, kv)
+		}
+		fileContent.Close()
+	}
+
+	sort.Sort(ByKey(intermediate))
+
+	// create output file
+	outFileName := fmt.Sprintf("mr-out-%d", task.Id)
+	outFile, err := os.Create(outFileName)
+	if err != nil {
+		return err
+	}
+
+	// Call reduce function and write to output file
+
+	i := 0
+	for i < len(intermediate) {
+		if err := c.Err(); err != nil {
+			outFile.Close()
+			return err
+		}
+		j := i + 1
+		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+			j++
+		}
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, intermediate[k].Value)
+		}
+		output := reducef(intermediate[i].Key, values)
+
+		fmt.Fprintf(outFile, "%v %v\n", intermediate[i].Key, output)
+
+		i = j
+	}
+
+	outFile.Close()
+	return nil
 }

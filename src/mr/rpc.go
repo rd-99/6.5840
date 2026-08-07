@@ -1,5 +1,7 @@
 package mr
 
+import "time"
+
 //
 // RPC definitions.
 //
@@ -46,14 +48,17 @@ const (
 )
 
 type Task struct {
-	Type    TaskType
-	Id      int
-	File    string
-	Status  TaskStatus
-	NReduce int
+	Type       TaskType
+	Id         int
+	File       string
+	Status     TaskStatus
+	NReduce    int
+	NMap       int
+	AssignedAt time.Time
 }
 
 type NotifyTaskDoneRequest struct {
-	Id   int
-	Type TaskType
+	Id            int
+	Type          TaskType
+	UpdatedStatus TaskStatus
 }
