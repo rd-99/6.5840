@@ -4,9 +4,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
+	"io"
 	"log"
 	"net/rpc"
 	"os"
+	"sort"
 	"time"
 )
 
@@ -26,6 +28,15 @@ func ihash(key string) int {
 
 var coordSockName string // socket for coordinator
 
+type ByKey []KeyValue
+
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
+func (a *KeyValue) Equal(b *KeyValue) bool {
+	return a.Key == b.Key && a.Value == b.Value
+}
+
 // main/mrworker.go calls this function.
 func Worker(sockname string, mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
@@ -34,10 +45,14 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 
 	// Your worker implementation here.
 	for {
-		task := getTask()
+		task, err := getTask()
+		if err != nil {
+			log.Fatalf("failed to get task: %v", err)
+		}
 
 		switch task.Type {
 		case MapTask:
+
 			content, err := os.ReadFile(task.File)
 			if err != nil {
 				log.Fatalf("cannot read %v", task.File)
@@ -45,11 +60,13 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 			// Call map function
 			kva := mapf(task.File, string(content))
 			// Write intermediate key-value pairs to files
-			buckets := make([][]KeyValue, task.nReduce)
+			buckets := make([][]KeyValue, task.NReduce)
 			for _, kv := range kva {
-				haskKey := ihash(kv.Key) % task.nReduce
+				haskKey := ihash(kv.Key) % task.NReduce
 				buckets[haskKey] = append(buckets[haskKey], kv)
 			}
+
+			
 
 			for y, bucket := range buckets {
 				// create temp file
@@ -67,20 +84,25 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 				tmpFile.Close()
 				os.Rename(tmpFile.Name(), fileName)
 			}
-
 			reportTaskDone(task)
+
 		case ReduceTask:
 			intermediate := []KeyValue{}
-			for i := 0; i < task.nReduce; i++ {
+			for i := 0; i < task.NReduce; i++ {
 				fileName := fmt.Sprintf("mr-%d-%d", task.Id, i)
 				fileContent, err := os.Open(fileName)
 				if err != nil {
-					fmt.Printf("encountered error while file opening, task- %d, file- %d", task.Id, i)
+					fmt.Printf("encountered error while file opening, task- %d, file- %d, err- %v", task.Id, i, err.Error())
 				}
 				reader := json.NewDecoder(fileContent)
 				for {
 					var kv KeyValue
-					if err := reader.Decode(&kv); err != nil {
+					err := reader.Decode(&kv)
+					if err == io.EOF {
+						break
+					}
+					if err != nil {
+						fmt.Printf("error decoding json: %v", err.Error())
 						break
 					}
 					intermediate = append(intermediate, kv)
@@ -88,10 +110,7 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 				fileContent.Close()
 			}
 
-			freq := map[string][]string{}
-			for _, kv := range intermediate {
-				freq[kv.Key] = append(freq[kv.Key], kv.Value)
-			}
+			sort.Sort(ByKey(intermediate))
 
 			// create output file
 			outFileName := fmt.Sprintf("mr-out-%d", task.Id)
@@ -101,12 +120,27 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 			}
 
 			// Call reduce function and write to output file
-			for key, values := range freq {
-				result := reducef(key, values)
-				fmt.Fprintf(outFile, "%s %s\n", key, result)
+
+			i := 0
+			for i < len(intermediate) {
+				j := i + 1
+				for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+					j++
+				}
+				values := []string{}
+				for k := i; k < j; k++ {
+					values = append(values, intermediate[k].Value)
+				}
+				output := reducef(intermediate[i].Key, values)
+
+				fmt.Fprintf(outFile, "%v %v\n", intermediate[i].Key, output)
+
+				i = j
 			}
+
 			outFile.Close()
-		case 0:
+			reportTaskDone(task)
+		case IdleTask:
 			time.Sleep(time.Second)
 		}
 	}
@@ -122,21 +156,21 @@ func reportTaskDone(task *Task) {
 		Type: task.Type,
 	}
 	responseArg := TaskReply{
-		task: task,
+		Task: task,
 	}
-	call("Coordinator.MarkTaskComplete", requestArg, responseArg)
+	call("Coordinator.MarkTaskComplete", &requestArg, &responseArg)
 }
 
-func getTask() *Task {
+func getTask() (*Task, error) {
 
 	req := struct{}{}
 	var reply TaskReply
 
-	err := call("Coordinator.fetchTask", &req, &reply)
-	if err == true {
-		return &Task{}
+	ok := call("Coordinator.FetchTask", &req, &reply)
+	if !ok {
+		return &Task{Type: IdleTask}, fmt.Errorf("failed to fetch task")
 	}
-	return reply.task
+	return reply.Task, nil
 }
 
 // example function to show how to make an RPC call to the coordinator.

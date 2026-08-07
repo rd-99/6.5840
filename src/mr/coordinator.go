@@ -46,7 +46,8 @@ func (c *Coordinator) server(sockname string) {
 func (c *Coordinator) Done() bool {
 
 	// Your code here.
-
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	return c.phase == DonePhase
 }
 
@@ -72,7 +73,15 @@ func MakeCoordinator(sockname string, files []string, nReduce int) *Coordinator 
 			Id:      i,
 			File:    file,
 			Status:  IdleStatus,
-			nReduce: 10,
+			NReduce: nReduce,
+		}
+	}
+	for i := 0; i < nReduce; i++ {
+		c.reduceTasks[i] = Task{
+			Type:    ReduceTask,
+			Id:      i,
+			Status:  IdleStatus,
+			NReduce: nReduce,
 		}
 	}
 
@@ -80,7 +89,7 @@ func MakeCoordinator(sockname string, files []string, nReduce int) *Coordinator 
 	return &c
 }
 
-func (c *Coordinator) fetchTask(args *struct{}, reply *TaskReply) error {
+func (c *Coordinator) FetchTask(args *struct{}, reply *TaskReply) error {
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -88,35 +97,31 @@ func (c *Coordinator) fetchTask(args *struct{}, reply *TaskReply) error {
 	switch c.phase {
 	case MapPhase:
 		for i, task := range c.mapTasks {
-			if task.Status == IdleStatus {
+			if task.Status == IdleStatus || task.Status == FailedStatus {
 				c.mapTasks[i].Status = RunningStatus
-				reply.task = &c.mapTasks[i]
-				return nil
-			}
-
-			if task.Status == FailedStatus {
-				c.mapTasks[i].Status = RunningStatus
-				reply.task = &c.mapTasks[i]
+				reply.Task = &c.mapTasks[i]
 				return nil
 			}
 		}
 
 	case ReducePhase:
 		for i, task := range c.reduceTasks {
-			if task.Status == IdleStatus {
+			if task.Status == IdleStatus || task.Status == FailedStatus {
 				c.reduceTasks[i].Status = RunningStatus
-				reply.task = &c.reduceTasks[i]
-				return nil
-			}
-
-			if task.Status == FailedStatus {
-				c.reduceTasks[i].Status = RunningStatus
-				reply.task = &c.reduceTasks[i]
+				reply.Task = &c.reduceTasks[i]
 				return nil
 			}
 		}
+	case DonePhase:
+		reply.Task = &Task{
+			Type: IdleTask,
+		}
+		return nil
 	}
-	return nil
+	reply.Task = &Task{
+		Type: IdleTask,
+	}
+	return nil //errors.New("no tasks available")
 }
 
 func (c *Coordinator) MarkTaskComplete(args *NotifyTaskDoneRequest, reply *TaskReply) error {
@@ -126,7 +131,10 @@ func (c *Coordinator) MarkTaskComplete(args *NotifyTaskDoneRequest, reply *TaskR
 
 	switch args.Type {
 	case MapTask:
-		c.mapTasks[args.Id].Status = DoneStatus
+		taskId := args.Id
+		c.mapTasks[taskId].Status = DoneStatus
+		c.reduceTasks[taskId].File = c.mapTasks[taskId].File
+
 		if c.checkAllMapTasksDone() {
 			c.phase = ReducePhase
 		}

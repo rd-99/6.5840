@@ -20,7 +20,7 @@ type ExampleReply struct {
 }
 
 type TaskReply struct {
-	task *Task
+	Task *Task
 }
 
 // Add your RPC definitions here.
@@ -50,7 +50,7 @@ type Task struct {
 	Id      int
 	File    string
 	Status  TaskStatus
-	nReduce int
+	NReduce int
 }
 
 type NotifyTaskDoneRequest struct {
