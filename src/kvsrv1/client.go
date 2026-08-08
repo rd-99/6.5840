@@ -2,10 +2,9 @@ package kvsrv
 
 import (
 	"6.5840/kvsrv1/rpc"
-	"6.5840/kvtest1"
-	"6.5840/tester1"
+	kvtest "6.5840/kvtest1"
+	tester "6.5840/tester1"
 )
-
 
 type Clerk struct {
 	clnt   *tester.Clnt
@@ -30,7 +29,15 @@ func MakeClerk(clnt *tester.Clnt, server string) kvtest.IKVClerk {
 // arguments. Additionally, reply must be passed as a pointer.
 func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 	// You will have to modify this function.
-	return "", 0, rpc.ErrNoKey
+	var args rpc.GetArgs
+	var resp rpc.GetReply
+	args.Key = key
+	ok := ck.clnt.Call(ck.server, "KVServer.Get", &args, &resp)
+	if !ok {
+		return "", 0, rpc.ErrNoKey
+	}
+
+	return resp.Value, resp.Version, resp.Err
 }
 
 // Put updates key with value only if the version in the
@@ -52,5 +59,14 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 // arguments. Additionally, reply must be passed as a pointer.
 func (ck *Clerk) Put(key, value string, version rpc.Tversion) rpc.Err {
 	// You will have to modify this function.
-	return rpc.ErrNoKey
+	var args rpc.PutArgs
+	var resp rpc.PutReply
+	args.Key = key
+	args.Value = value
+	args.Version = version
+	ok := ck.clnt.Call(ck.server, "KVServer.Put", &args, &resp)
+	if !ok {
+		return rpc.ErrNoKey
+	}
+	return resp.Err
 }
