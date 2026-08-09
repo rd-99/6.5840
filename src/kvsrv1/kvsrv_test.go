@@ -124,7 +124,7 @@ func TestUnreliableNet(t *testing.T) {
 	ck := ts.MakeClerk()
 
 	retried := false
-	for try := 0; try < NTRY; try++ {
+	for try := range NTRY {
 		for i := 0; true; i++ {
 			if err := ts.PutJson(ck, "k", i, rpc.Tversion(try), 0); err != rpc.ErrMaybe {
 				if i > 0 && err != rpc.ErrVersion {
